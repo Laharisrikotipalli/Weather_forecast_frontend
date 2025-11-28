@@ -1,88 +1,138 @@
+# lambda_function.py
 import json
 import boto3
 import datetime
 import time
 import os
+import re
 
-# AWS Resources
-dynamodb = boto3.resource('dynamodb', region_name=os.environ.get("REGION", "ap-southeast-2"))
-table_name = os.environ.get("table_name", "weather_data")
-table = dynamodb.Table(table_name)
-
-sns = boto3.client('sns')
+# Config from environment (set these in Lambda Configuration -> Environment variables)
+REGION = os.environ.get("REGION", "us-east-1")
+TABLE_NAME = os.environ.get("table_name", "weather_data")
 TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
+MASTER_API_KEY = os.environ.get("MasterAPIKey")  # used only if DEMO_MODE = False
 
-# DEMO MODE: force alerts regardless of real weather
+# DEMO_MODE: if True, returns mocked weather (no external API call)
 DEMO_MODE = True
 
+# AWS Clients / Resources
+dynamodb = boto3.resource('dynamodb', region_name=REGION)
+table = dynamodb.Table(TABLE_NAME)
+sns = boto3.client('sns', region_name=REGION)
+
+def _extract_number(text):
+    """Return numeric part of a string (e.g. '26°C' -> '26', '5 m/s' -> '5')."""
+    if text is None:
+        return ""
+    m = re.search(r"-?\d+(\.\d+)?", str(text))
+    return m.group(0) if m else str(text)
+
+def _make_forecast(description, temp_numeric, days=7):
+    """Create a simple forecast list with the same condition for next days days."""
+    forecast = []
+    now = datetime.datetime.utcnow().date()
+    for i in range(days):
+        day = now + datetime.timedelta(days=i)
+        forecast.append({
+            "Date": day.strftime("%Y-%m-%d"),
+            "Temperature": temp_numeric,
+            "Condition": description
+        })
+    return forecast
+
 def lambda_handler(event, context):
+    # Read city from query string parameters
     city = event.get("queryStringParameters", {}).get("city", "Peddapuram")
-    
-    if DEMO_MODE:
-        description = "Rain showers"
-        temperature = "26°C"
-        humidity = "90%"
-        wind_speed = "5 m/s"
-    else:
-        # Real API call here (requires valid API key)
-        api_key = os.environ.get("MasterAPIKey")
-        url = f"https://api.weatherbit.io/v2.0/current?city={city}&key={api_key}"
-        try:
+
+    try:
+        if DEMO_MODE:
+            # Demo values (strings with units)
+            description = "Rain showers"
+            temperature = "26°C"
+            humidity = "90%"
+            wind_speed = "5 m/s"
+        else:
+            # Real API call (example: weatherbit); requires MASTER_API_KEY to be set
+            if not MASTER_API_KEY:
+                raise Exception("MasterAPIKey environment variable not set.")
+            url = f"https://api.weatherbit.io/v2.0/current?city={city}&key={MASTER_API_KEY}"
             import urllib.request
-            response = urllib.request.urlopen(url)
+            response = urllib.request.urlopen(url, timeout=10)
             data = json.loads(response.read().decode("utf-8"))
             weather = data["data"][0]
             description = weather['weather']['description']
             temperature = f"{weather['temp']}°C"
             humidity = f"{weather['rh']}%"
             wind_speed = f"{weather['wind_spd']} m/s"
-        except Exception as e:
-            return {
-                "statusCode": 500,
-                "body": f"Failed to fetch weather: {str(e)}"
+
+        # Create timestamps and TTL for DynamoDB
+        timestamp = datetime.datetime.utcnow().isoformat()
+        ttl_timestamp = int(time.time()) + 3600  # 1 hour TTL
+
+        # Store original display strings in DynamoDB (so UI screenshots match)
+        table.put_item(
+            Item={
+                "city": city,
+                "timestamp": timestamp,
+                "temperature": temperature,
+                "humidity": humidity,
+                "wind_speed": wind_speed,
+                "description": description,
+                "ttl_timestamp": ttl_timestamp
             }
+        )
 
-    # Timestamp & TTL
-    timestamp = datetime.datetime.utcnow().isoformat()
-    ttl_timestamp = int(time.time()) + 3600
+        # Send SNS alert on rain (if configured)
+        if "rain" in (description or "").lower() and TOPIC_ARN:
+            message = f"🌧 Weather Alert! Rain expected in {city}.\nTemp: {temperature}\nHumidity: {humidity}\nWind: {wind_speed}"
+            try:
+                sns.publish(
+                    TopicArn=TOPIC_ARN,
+                    Message=message,
+                    Subject=f"Weather Alert: Rain in {city}"
+                )
+            except Exception as e:
+                # Just log; do not fail the function because of SNS issues
+                print(f"Failed to send SNS notification: {str(e)}")
 
-    # Store in DynamoDB
-    table.put_item(
-        Item={
-            "city": city,
-            "timestamp": timestamp,
-            "temperature": temperature,
-            "humidity": humidity,
-            "wind_speed": wind_speed,
-            "description": description,
-            "ttl_timestamp": ttl_timestamp
+        # Prepare response in the shape expected by the frontend
+        temp_num = _extract_number(temperature)       # e.g. "26"
+        humidity_num = _extract_number(humidity)      # e.g. "90"
+        wind_num = _extract_number(wind_speed)        # e.g. "5"
+
+        response_body = {
+            "CityName": city,
+            "Current": {
+                "Temperature": temp_num,
+                "Condition": description,
+                "Humidity": humidity_num,
+                "WindSpeed": wind_num
+            },
+            "Forecast": _make_forecast(description, temp_num, days=7)
         }
-    )
 
-    # Send SNS alert if it rains
-    if "rain" in description.lower():
-        message = f"🌧 Weather Alert! Rain expected in {city}.\nTemp: {temperature}\nHumidity: {humidity}\nWind: {wind_speed}"
-        try:
-            sns.publish(
-                TopicArn=TOPIC_ARN,
-                Message=message,
-                Subject=f"Weather Alert: Rain in {city}"
-            )
-        except Exception as e:
-            print(f"Failed to send SNS notification: {str(e)}")
-
-    return {
-        "statusCode": 200,
-        "body": json.dumps({
-            "message": "Weather data stored successfully!",
-            "city": city,
-            "temperature": temperature,
-            "humidity": humidity,
-            "wind_speed": wind_speed,
-            "description": description
-        }),
-        "headers": {
-            "Content-Type": "application/json",
-            "Access-Control-Allow-Origin": "*"
+        return {
+            "statusCode": 200,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*",               # CORS
+                "Access-Control-Allow-Methods": "GET,OPTIONS",
+                "Access-Control-Allow-Headers": "Content-Type"
+            },
+            "body": json.dumps(response_body)
         }
-    }
+
+    except Exception as e:
+        # On error, return helpful message and CORS headers so browser can read it
+        print("Error in lambda:", str(e))
+        return {
+            "statusCode": 500,
+            "headers": {
+                "Content-Type": "application/json",
+                "Access-Control-Allow-Origin": "*"
+            },
+            "body": json.dumps({
+                "error": "Failed to process request",
+                "details": str(e)
+            })
+        }
