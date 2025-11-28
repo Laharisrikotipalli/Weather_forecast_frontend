@@ -1,0 +1,88 @@
+import json
+import boto3
+import datetime
+import time
+import os
+
+# AWS Resources
+dynamodb = boto3.resource('dynamodb', region_name=os.environ.get("REGION", "ap-southeast-2"))
+table_name = os.environ.get("table_name", "weather_data")
+table = dynamodb.Table(table_name)
+
+sns = boto3.client('sns')
+TOPIC_ARN = os.environ.get("SNS_TOPIC_ARN")
+
+# DEMO MODE: force alerts regardless of real weather
+DEMO_MODE = True
+
+def lambda_handler(event, context):
+    city = event.get("queryStringParameters", {}).get("city", "Peddapuram")
+    
+    if DEMO_MODE:
+        description = "Rain showers"
+        temperature = "26°C"
+        humidity = "90%"
+        wind_speed = "5 m/s"
+    else:
+        # Real API call here (requires valid API key)
+        api_key = os.environ.get("MasterAPIKey")
+        url = f"https://api.weatherbit.io/v2.0/current?city={city}&key={api_key}"
+        try:
+            import urllib.request
+            response = urllib.request.urlopen(url)
+            data = json.loads(response.read().decode("utf-8"))
+            weather = data["data"][0]
+            description = weather['weather']['description']
+            temperature = f"{weather['temp']}°C"
+            humidity = f"{weather['rh']}%"
+            wind_speed = f"{weather['wind_spd']} m/s"
+        except Exception as e:
+            return {
+                "statusCode": 500,
+                "body": f"Failed to fetch weather: {str(e)}"
+            }
+
+    # Timestamp & TTL
+    timestamp = datetime.datetime.utcnow().isoformat()
+    ttl_timestamp = int(time.time()) + 3600
+
+    # Store in DynamoDB
+    table.put_item(
+        Item={
+            "city": city,
+            "timestamp": timestamp,
+            "temperature": temperature,
+            "humidity": humidity,
+            "wind_speed": wind_speed,
+            "description": description,
+            "ttl_timestamp": ttl_timestamp
+        }
+    )
+
+    # Send SNS alert if it rains
+    if "rain" in description.lower():
+        message = f"🌧 Weather Alert! Rain expected in {city}.\nTemp: {temperature}\nHumidity: {humidity}\nWind: {wind_speed}"
+        try:
+            sns.publish(
+                TopicArn=TOPIC_ARN,
+                Message=message,
+                Subject=f"Weather Alert: Rain in {city}"
+            )
+        except Exception as e:
+            print(f"Failed to send SNS notification: {str(e)}")
+
+    return {
+        "statusCode": 200,
+        "body": json.dumps({
+            "message": "Weather data stored successfully!",
+            "city": city,
+            "temperature": temperature,
+            "humidity": humidity,
+            "wind_speed": wind_speed,
+            "description": description
+        }),
+        "headers": {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*"
+        }
+    }
